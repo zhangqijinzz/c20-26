@@ -1,24 +1,45 @@
-import { AlertTriangle, Crosshair, RotateCcw, RotateCw, Ruler, Trash2 } from 'lucide-react'
-import type { DeskItem, WorkspacePlan } from '../../../shared/models'
+import { AlertTriangle, AlignCenterHorizontal, AlignCenterVertical, AlignEndHorizontal, AlignEndVertical, AlignHorizontalDistributeCenter, AlignStartHorizontal, AlignStartVertical, AlignVerticalDistributeCenter, Crosshair, Layers, RotateCcw, RotateCw, Ruler, Trash2 } from 'lucide-react'
+import type { DeskItem, DeviceType, WorkspacePlan } from '../../../shared/models'
 import { getDeviceDefinition } from '../../../shared/models'
+import type { AlignMode, DistributeAxis } from '../../canvas/arrangeItems'
 
 interface InspectorPanelProps {
   plan: WorkspacePlan
-  item: DeskItem | null
+  items: DeskItem[]
   issueIds: string[]
   onUpdateDesk: (field: 'deskWidthMm' | 'deskHeightMm', value: number) => void
   onUpdateItem: (id: string, patch: Partial<Pick<DeskItem, 'widthMm' | 'heightMm' | 'x' | 'y'>>) => void
   onRotate: (id: string, delta: number) => void
   onDelete: (id: string) => void
+  onDeleteMany: (ids: string[]) => void
+  onAlign: (mode: AlignMode) => void
+  onDistribute: (axis: DistributeAxis) => void
 }
 
 function NumericField({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {
   return <label className="numeric-field"><span>{label}</span><input type="number" value={value} min={40} onChange={(event) => onChange(event.currentTarget.valueAsNumber)} /><em>mm</em></label>
 }
 
-export function InspectorPanel({ plan, item, issueIds, onUpdateDesk, onUpdateItem, onRotate, onDelete }: InspectorPanelProps) {
+function summarizeTypes(items: DeskItem[]): string {
+  const counts = new Map<DeviceType, number>()
+  items.forEach((item) => counts.set(item.type, (counts.get(item.type) ?? 0) + 1))
+  return [...counts.entries()].map(([type, count]) => `${getDeviceDefinition(type).label} ×${count}`).join(' · ')
+}
+
+const ALIGN_BUTTONS: Array<{ mode: AlignMode; label: string; icon: typeof AlignStartVertical }> = [
+  { mode: 'left', label: '左对齐', icon: AlignStartVertical },
+  { mode: 'centerX', label: '水平居中', icon: AlignCenterVertical },
+  { mode: 'right', label: '右对齐', icon: AlignEndVertical },
+  { mode: 'top', label: '顶对齐', icon: AlignStartHorizontal },
+  { mode: 'centerY', label: '垂直居中', icon: AlignCenterHorizontal },
+  { mode: 'bottom', label: '底对齐', icon: AlignEndHorizontal },
+]
+
+export function InspectorPanel({ plan, items, issueIds, onUpdateDesk, onUpdateItem, onRotate, onDelete, onDeleteMany, onAlign, onDistribute }: InspectorPanelProps) {
+  const item = items.length === 1 ? items[0] : null
   const isIssue = item ? issueIds.includes(item.id) : false
   const definition = item ? getDeviceDefinition(item.type) : null
+  const selectedIssueCount = items.filter((selected) => issueIds.includes(selected.id)).length
   return (
     <aside className="inspector-panel">
       <div className="module-heading">
@@ -33,7 +54,25 @@ export function InspectorPanel({ plan, item, issueIds, onUpdateDesk, onUpdateIte
         </div>
         <p className="helper-text">建议保留 40 mm 走线缓冲空间</p>
       </div>
-      {item && definition ? (
+      {items.length > 1 ? (
+        <div className="item-editor multi-editor">
+          <div className="selected-item-heading"><span className="selected-swatch multi-swatch"><Layers size={14} /></span> <div><strong>已选中 {items.length} 件设备</strong><small>{summarizeTypes(items)}</small></div><span className="item-code">MULTI</span></div>
+          {selectedIssueCount > 0 && <div className="issue-callout"><AlertTriangle size={16} /><span>{selectedIssueCount} 件选中设备与其他元素重叠或超出桌面边界</span></div>}
+          <div className="field-heading"><span>对齐</span><span className="unit-label">以旋转后的实际范围为准</span></div>
+          <div className="align-grid">
+            {ALIGN_BUTTONS.map(({ mode, label, icon: Icon }) => (
+              <button key={mode} type="button" title={label} aria-label={label} onClick={() => onAlign(mode)}><Icon size={15} /></button>
+            ))}
+          </div>
+          <div className="field-heading"><span>等距分布</span><span className="unit-label">首尾固定，间距均分</span></div>
+          <div className="distribute-row">
+            <button type="button" disabled={items.length < 3} onClick={() => onDistribute('horizontal')}><AlignHorizontalDistributeCenter size={15} /> 水平等距</button>
+            <button type="button" disabled={items.length < 3} onClick={() => onDistribute('vertical')}><AlignVerticalDistributeCenter size={15} /> 垂直等距</button>
+          </div>
+          <p className="helper-text">拖动任一选中设备即可整体平移；若对齐或分布会把设备顶出桌面、压住其他设备，会先提醒你确认。</p>
+          <button className="remove-item-button" onClick={() => onDeleteMany(items.map((selected) => selected.id))} type="button"><Trash2 size={15} /> 移除这 {items.length} 件设备</button>
+        </div>
+      ) : item && definition ? (
         <div className="item-editor">
           <div className="selected-item-heading"><span className="selected-swatch" style={{ backgroundColor: definition.color }} /> <div><strong>{definition.label}</strong><small>{definition.hint}</small></div><span className="item-code">{definition.shortLabel}</span></div>
           {isIssue && <div className="issue-callout"><AlertTriangle size={16} /><span>设备与其他元素重叠或超出桌面边界</span></div>}
@@ -51,7 +90,7 @@ export function InspectorPanel({ plan, item, issueIds, onUpdateDesk, onUpdateIte
           <button className="remove-item-button" onClick={() => onDelete(item.id)} type="button"><Trash2 size={15} /> 移除这个设备</button>
         </div>
       ) : (
-        <div className="empty-inspector"><span className="empty-illustration">⌖</span><strong>选择一个设备</strong><p>点击画布上的设备查看尺寸、位置和旋转控制。</p></div>
+        <div className="empty-inspector"><span className="empty-illustration">⌖</span><strong>选择一个设备</strong><p>点击画布上的设备查看尺寸、位置和旋转控制；拖动空白处可框选多件设备。</p></div>
       )}
     </aside>
   )

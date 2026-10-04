@@ -12,8 +12,16 @@ import {
 } from '../../shared/models'
 import { clampDeskSize, clampItemDimension } from '../../shared/layoutRules'
 import { moveCanvasItem, rotateCanvasItem } from '../canvas/canvasViewModel'
+import {
+  ALIGN_LABELS,
+  DISTRIBUTE_LABELS,
+  alignItems,
+  distributeItems,
+  type AlignMode,
+  type DistributeAxis,
+} from '../canvas/arrangeItems'
 import { createMaterialDraft } from '../materials/materialsViewModel'
-import { inspectPlan } from '../inspection/inspectionViewModel'
+import { inspectPlan, summarizeArrangementIssues } from '../inspection/inspectionViewModel'
 import { LocalWorkspaceRepository, type WorkspaceRepository } from './workspaceRepository'
 
 export interface WorkspaceViewModel {
@@ -21,17 +29,25 @@ export interface WorkspaceViewModel {
   document: WorkspaceDocument | null
   activePlan: WorkspacePlan | null
   selectedItem: DeskItem | null
+  selectedItemIds: string[]
+  selectedItems: DeskItem[]
   analysis: LayoutAnalysis
   issueIds: string[]
   issueCount: number
   feedback: string
   isPreviewOpen: boolean
   selectItem: (id: string | null) => void
+  toggleSelectItem: (id: string) => void
+  selectItems: (ids: string[], additive: boolean) => void
   addItem: (type: DeviceType) => void
   removeItem: (id: string) => void
+  removeItems: (ids: string[]) => void
   moveItem: (id: string, x: number, y: number) => void
+  moveItems: (updates: Array<{ id: string; x: number; y: number }>) => void
   rotateItem: (id: string, delta: number) => void
   updateItem: (id: string, patch: Partial<Pick<DeskItem, 'widthMm' | 'heightMm' | 'x' | 'y'>>) => void
+  alignSelected: (mode: AlignMode) => void
+  distributeSelected: (axis: DistributeAxis) => void
   updateDesk: (field: 'deskWidthMm' | 'deskHeightMm', value: number) => void
   createNewPlan: () => void
   duplicatePlan: () => void
@@ -47,9 +63,10 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
   const repositoryRef = useRef(repository ?? new LocalWorkspaceRepository())
   const [status, setStatus] = useState<WorkspaceStatus>('loading')
   const [document, setDocument] = useState<WorkspaceDocument | null>(null)
-  const [selectedItemId, setSelectedItemId] = useState<string | null>(null)
+  const [selectedItemIds, setSelectedItemIds] = useState<string[]>([])
   const [isPreviewOpen, setIsPreviewOpen] = useState(false)
   const [feedback, setFeedback] = useState('正在准备你的工作台…')
+  const pendingArrangeRef = useRef<string | null>(null)
 
   useEffect(() => {
     let active = true
@@ -72,7 +89,11 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     () => document?.plans.find((plan) => plan.id === document.activePlanId) ?? null,
     [document],
   )
-  const selectedItem = activePlan?.items.find((item) => item.id === selectedItemId) ?? null
+  const selectedItems = useMemo(
+    () => activePlan?.items.filter((item) => selectedItemIds.includes(item.id)) ?? [],
+    [activePlan, selectedItemIds],
+  )
+  const selectedItem = selectedItems.length === 1 ? selectedItems[0] : null
   const inspection = useMemo(() => activePlan ? inspectPlan(activePlan) : emptyInspection, [activePlan])
   const { analysis, issueIds, issueCount } = inspection
 
@@ -96,18 +117,53 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     void persist(nextDocument, message)
   }, [activePlan, document, persist])
 
-  const selectItem = useCallback((id: string | null) => setSelectedItemId(id), [])
+  const selectItem = useCallback((id: string | null) => {
+    pendingArrangeRef.current = null
+    setSelectedItemIds(id ? [id] : [])
+  }, [])
+
+  const toggleSelectItem = useCallback((id: string) => {
+    pendingArrangeRef.current = null
+    setSelectedItemIds((current) => current.includes(id) ? current.filter((itemId) => itemId !== id) : [...current, id])
+  }, [])
+
+  const selectItems = useCallback((ids: string[], additive: boolean) => {
+    pendingArrangeRef.current = null
+    setSelectedItemIds((current) => additive ? [...new Set([...current, ...ids])] : ids)
+  }, [])
 
   const addItem = useCallback((type: DeviceType) => {
     if (!activePlan) return
+    pendingArrangeRef.current = null
     const draft = createMaterialDraft(type, activePlan.items.length)
     updateActivePlan((plan) => ({ ...plan, items: [...plan.items, draft.item] }), draft.feedback)
-    setSelectedItemId(draft.item.id)
+    setSelectedItemIds([draft.item.id])
   }, [activePlan, updateActivePlan])
 
-  const removeItem = useCallback((id: string) => {
-    updateActivePlan((plan) => ({ ...plan, items: plan.items.filter((item) => item.id !== id) }), '设备已移除')
-    setSelectedItemId((current) => current === id ? null : current)
+  const removeItems = useCallback((ids: string[]) => {
+    if (ids.length === 0) return
+    pendingArrangeRef.current = null
+    const removed = new Set(ids)
+    updateActivePlan(
+      (plan) => ({ ...plan, items: plan.items.filter((item) => !removed.has(item.id)) }),
+      ids.length > 1 ? `已移除 ${ids.length} 件设备` : '设备已移除',
+    )
+    setSelectedItemIds((current) => current.filter((id) => !removed.has(id)))
+  }, [updateActivePlan])
+
+  const removeItem = useCallback((id: string) => removeItems([id]), [removeItems])
+
+  const moveItems = useCallback((updates: Array<{ id: string; x: number; y: number }>) => {
+    if (updates.length === 0) return
+    pendingArrangeRef.current = null
+    const positionById = new Map(updates.map((update) => [update.id, update]))
+    updateActivePlan((plan) => ({
+      ...plan,
+      items: plan.items.map((item) => {
+        const position = positionById.get(item.id)
+        return position ? { ...item, x: position.x, y: position.y } : item
+      }),
+    }), '位置已更新')
   }, [updateActivePlan])
 
   const moveItem = useCallback((id: string, x: number, y: number) => {
@@ -115,10 +171,12 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
   }, [updateActivePlan])
 
   const rotateItem = useCallback((id: string, delta: number) => {
+    pendingArrangeRef.current = null
     updateActivePlan((plan) => ({ ...plan, items: rotateCanvasItem(plan.items, id, delta) }), '角度已更新')
   }, [updateActivePlan])
 
   const updateItem = useCallback((id: string, patch: Partial<Pick<DeskItem, 'widthMm' | 'heightMm' | 'x' | 'y'>>) => {
+    pendingArrangeRef.current = null
     updateActivePlan((plan) => ({
       ...plan,
       items: plan.items.map((item) => item.id === id ? {
@@ -130,6 +188,42 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     }), '尺寸参数已更新')
   }, [updateActivePlan])
 
+  const runArrangement = useCallback((label: string, signature: string, compute: (items: DeskItem[]) => DeskItem[]) => {
+    if (!activePlan) return
+    const summary = summarizeArrangementIssues(activePlan, compute(activePlan.items), selectedItemIds)
+    if (summary.hasIssues && pendingArrangeRef.current !== signature) {
+      pendingArrangeRef.current = signature
+      const risks: string[] = []
+      if (summary.outOfBoundsCount > 0) risks.push(`${summary.outOfBoundsCount} 件设备将被顶出桌面`)
+      if (summary.overlapCount > 0) risks.push(`${summary.overlapCount} 件设备会压住其他设备`)
+      setFeedback(`${label}后${risks.join('、')}，再次点击「${label}」确认执行`)
+      return
+    }
+    pendingArrangeRef.current = null
+    updateActivePlan(
+      (plan) => ({ ...plan, items: compute(plan.items) }),
+      summary.hasIssues ? `${label}完成，请留意红色标记的设备` : `${label}完成`,
+    )
+  }, [activePlan, selectedItemIds, updateActivePlan])
+
+  const alignSelected = useCallback((mode: AlignMode) => {
+    if (selectedItemIds.length < 2) {
+      setFeedback('请先在画布上选择至少 2 件设备')
+      return
+    }
+    const signature = `align:${mode}:${[...selectedItemIds].sort().join('|')}`
+    runArrangement(ALIGN_LABELS[mode], signature, (items) => alignItems(items, selectedItemIds, mode))
+  }, [runArrangement, selectedItemIds])
+
+  const distributeSelected = useCallback((axis: DistributeAxis) => {
+    if (selectedItemIds.length < 3) {
+      setFeedback('等距分布至少需要 3 件设备')
+      return
+    }
+    const signature = `distribute:${axis}:${[...selectedItemIds].sort().join('|')}`
+    runArrangement(DISTRIBUTE_LABELS[axis], signature, (items) => distributeItems(items, selectedItemIds, axis))
+  }, [runArrangement, selectedItemIds])
+
   const updateDesk = useCallback((field: 'deskWidthMm' | 'deskHeightMm', value: number) => {
     if (!activePlan) return
     updateActivePlan((plan) => ({ ...plan, [field]: clampDeskSize(value, plan[field]) }), '桌面尺寸已更新')
@@ -139,7 +233,7 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     if (!document) return
     const plan = createPlan(`工作台 ${document.plans.length + 1}`, false)
     void persist({ ...document, plans: [...document.plans, plan], activePlanId: plan.id }, '已创建空白方案')
-    setSelectedItemId(null)
+    setSelectedItemIds([])
   }, [document, persist])
 
   const duplicatePlan = useCallback(() => {
@@ -152,13 +246,13 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
       updatedAt: new Date().toISOString(),
     }
     void persist({ ...document, plans: [...document.plans, copy], activePlanId: copy.id }, '方案已复制')
-    setSelectedItemId(null)
+    setSelectedItemIds([])
   }, [activePlan, document, persist])
 
   const selectPlan = useCallback((id: string) => {
     if (!document || !document.plans.some((plan) => plan.id === id)) return
     void persist({ ...document, activePlanId: id }, '已切换方案')
-    setSelectedItemId(null)
+    setSelectedItemIds([])
   }, [document, persist])
 
   const deleteCurrentPlan = useCallback(() => {
@@ -168,7 +262,7 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     }
     const remaining = document.plans.filter((plan) => plan.id !== activePlan.id)
     void persist({ ...document, plans: remaining, activePlanId: remaining[0].id }, '方案已删除')
-    setSelectedItemId(null)
+    setSelectedItemIds([])
   }, [activePlan, document, persist])
 
   const openPreview = useCallback(() => setIsPreviewOpen(true), [])
@@ -179,17 +273,25 @@ export function useWorkspaceViewModel(repository?: WorkspaceRepository): Workspa
     document,
     activePlan,
     selectedItem,
+    selectedItemIds,
+    selectedItems,
     analysis,
     issueIds,
     issueCount,
     feedback,
     isPreviewOpen,
     selectItem,
+    toggleSelectItem,
+    selectItems,
     addItem,
     removeItem,
+    removeItems,
     moveItem,
+    moveItems,
     rotateItem,
     updateItem,
+    alignSelected,
+    distributeSelected,
     updateDesk,
     createNewPlan,
     duplicatePlan,
